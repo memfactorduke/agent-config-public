@@ -23,8 +23,10 @@ Run subagents on the remote box by default: it's spare compute, it can run most 
 
 Keep one on this machine only when it needs this machine:
 - computer use, a logged-in browser, a simulator or device, or a macOS-only tool such as Xcode;
-- files that live only here, such as video and editing media on local drives, or work you haven't pushed;
+- files too big to copy, such as video and editing media on local drives;
 - local secrets, services or MCP servers that the remote box doesn't have.
+
+Small files that live only here are not a reason to stay. Copy them over with `rsync -a`, or push unpushed work first, and point the child at the copy. Most review rounds, image sets, briefs and scratch folders are small.
 
 Helpers a skill spawns for itself (pstack, for example) run where the skill puts them. A quick read-only lookup can stay here too.
 

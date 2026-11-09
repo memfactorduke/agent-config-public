@@ -38,7 +38,7 @@ Each chosen model gets one reviewer.
 
 Use your harness's question tool (`AskUserQuestion` in Claude Code, `request_user_input` in Codex) as far as its limits allow. Ask whatever it can't hold as a numbered list in chat, with your recommendations marked, then end your turn and start when the user replies. Use the recommendations without asking only if the user says not to ask.
 
-**Map the council.** Give each reviewer a slot ID, a short name for its model (`opus`, `sol`). Map each slot to the tool that will start it, its model, and a machine where it can read the workspace and see the work. If a reviewer runs on another machine, copy or sync the workspace there before every round. If a slot can't run, tell the user and get a revised council before you start.
+**Map the council.** Give each reviewer a slot ID, a short name for its model (`opus`, `sol`). Map each slot to the tool that will start it, its model, and a machine where it can read the workspace and see the work. If your instructions name a remote machine for subagents, run reviewers there by default, and keep a slot local only when it needs something that can't be copied, such as a running local server or a device. Before every round, copy the workspace to each reviewer's machine (`rsync -a`), and give the reviewer paths in that copy. If a slot can't run, tell the user and get a revised council before you start.
 
 **Define the pass.** The overall score must reach the threshold. So must every criterion the user named as a target; by default, that's all of them. Every hard requirement must hold, and the reviewer must report no blockers (for a candidate set, none tagged with that candidate's ID).
 
