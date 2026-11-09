@@ -6,6 +6,16 @@ Global instructions, plugins, skills and MCP servers for coding agents (Claude C
 
 This repo is a public, anonymized mirror of a working setup. It updates automatically whenever the original changes. Everything that's specific to one person or one computer is left out; you supply your own in `~/.agent-config/local/`, and sync never overwrites it.
 
+## Quick start: let your agent do it
+
+Paste this to Claude Code, Codex or any coding agent with a shell, on each machine:
+
+```
+Set up agent-config on this machine: clone https://github.com/memfactorduke/agent-config-public.git to ~/.agent-config/repo (or pull it if it's already there), then follow SETUP.md in it.
+```
+
+[`SETUP.md`](SETUP.md) has the agent install what's missing and work out your git identity, tailnet and remote box. It moves your existing instructions into your own layer, runs the first sync and schedules the daily one, then reports what it did. It asks you only for what it can't look up. The rest of this README covers what it sets up, for doing it by hand.
+
 ## What gets built
 
 Each tool's global instruction file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …) is built from these layers, in order:
@@ -19,7 +29,7 @@ Each tool's global instruction file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`
 
 `manifest.json` lists the plugins, skills and MCP servers to install. `skills/` holds skills kept in this repo; everything else is pulled from upstream (mattpocock/skills, t3dotgg/tstack, emilkowalski/skills). `pstack-models.md` is copied to `~/.claude/rules/` and sets pstack's model per role.
 
-## Set up a machine
+## Set up a machine by hand
 
 Needs `git` and `python3` (3.9+). Repeat on each machine, with a different machine name each time.
 
