@@ -1,0 +1,12 @@
+{
+  "machines": {
+    "laptop": { "label": "Laptop", "os": "mac", "host": "my-laptop" },
+    "vps": { "label": "VPS", "os": "linux", "host": "my-vps" }
+  },
+  "mcp": [
+    { "name": "blender", "tool": "both", "local": true, "machines": ["laptop"] }
+  ],
+  "skill_sources": [
+    { "name": "mine", "dir": "skills", "skills": { "my-skill": "all" } }
+  ]
+}

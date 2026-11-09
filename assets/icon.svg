@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>agent-config</title>
+  <desc>One source fans out to three matching copies.</desc>
+  <defs>
+    <path id="node" d="M 0,-124
+      C -8,-124 -15,-122 -22,-118
+      L -101,-72
+      C -113,-65 -120,-53 -120,-40
+      L -120,40
+      C -120,53 -113,65 -101,72
+      L -22,118
+      C -15,122 -8,124 0,124
+      C 8,124 15,122 22,118
+      L 101,72
+      C 113,65 120,53 120,40
+      L 120,-40
+      C 120,-53 113,-65 101,-72
+      L 22,-118
+      C 15,-122 8,-124 0,-124 Z" />
+  </defs>
+
+  <rect x="80" y="80" width="864" height="864" rx="190" fill="#46279D" />
+
+  <g fill="none" stroke="#967BD7" stroke-width="60" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 512,404 L 512,484" />
+    <path d="M 512,484 C 416,520 250,520 250,628 L 250,712" />
+    <path d="M 512,484 L 512,712" />
+    <path d="M 512,484 C 608,520 774,520 774,628 L 774,712" />
+  </g>
+
+
+  <g fill="#FF7966" stroke="#46279D" stroke-width="18" stroke-linejoin="round">
+    <use href="#node" x="512" y="305" />
+    <use href="#node" transform="translate(250 763) scale(.66)" />
+    <use href="#node" transform="translate(512 763) scale(.66)" />
+    <use href="#node" transform="translate(774 763) scale(.66)" />
+  </g>
+</svg>

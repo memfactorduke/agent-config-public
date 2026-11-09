@@ -1,0 +1,257 @@
+{
+  "source": "github.com/memfactorduke/agent-config-public",
+  "machines": {},
+  "instructions": {
+    "claude": {
+      "path": "~/.claude/CLAUDE.md",
+      "layers": [
+        "core",
+        "providers/claude-code",
+        "personal",
+        "machine"
+      ]
+    },
+    "codex": {
+      "path": "~/.codex/AGENTS.md",
+      "layers": [
+        "core",
+        "providers/codex",
+        "personal",
+        "machine"
+      ]
+    },
+    "grok": {
+      "path": "~/.grok/AGENTS.md",
+      "layers": [
+        "core",
+        "personal",
+        "machine"
+      ],
+      "only_if_exists": "~/.grok"
+    },
+    "opencode": {
+      "path": "~/.config/opencode/AGENTS.md",
+      "layers": [
+        "core",
+        "personal",
+        "machine"
+      ],
+      "only_if_exists": "~/.config/opencode"
+    },
+    "pi": {
+      "path": "~/.pi/agent/AGENTS.md",
+      "layers": [
+        "core",
+        "personal",
+        "machine"
+      ],
+      "only_if_exists": "~/.pi/agent"
+    }
+  },
+  "files": [
+    {
+      "src": "pstack-models.md",
+      "dest": "~/.claude/rules/pstack-models.md",
+      "why": "pstack's per-role models (its Claude and Codex builds both read this path)"
+    }
+  ],
+  "grok_config": {
+    "compat.claude": {
+      "agents": false,
+      "rules": false
+    }
+  },
+  "remove_files": {},
+  "plugins": [
+    {
+      "id": "pstack@cursor-plugins",
+      "marketplace": "cursor/plugins",
+      "tools": [
+        "claude",
+        "codex"
+      ],
+      "machines": "all",
+      "why": "Lauren Tan's upstream pstack. Claude and Codex both install upstream's Claude Code build (harness/pstack/claude-code)."
+    },
+    {
+      "id": "frontend-design@claude-code-plugins",
+      "tools": [
+        "claude"
+      ],
+      "machines": "all",
+      "marketplace": "anthropics/claude-code"
+    },
+    {
+      "id": "documents@openai-primary-runtime",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs",
+      "why": "Ships with the ChatGPT desktop app, so Macs only"
+    },
+    {
+      "id": "pdf@openai-primary-runtime",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs",
+      "why": "Ships with the ChatGPT desktop app, so Macs only"
+    },
+    {
+      "id": "spreadsheets@openai-primary-runtime",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs",
+      "why": "Ships with the ChatGPT desktop app, so Macs only"
+    },
+    {
+      "id": "presentations@openai-primary-runtime",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs",
+      "why": "Ships with the ChatGPT desktop app, so Macs only"
+    },
+    {
+      "id": "template-creator@openai-primary-runtime",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs",
+      "why": "Ships with the ChatGPT desktop app, so Macs only"
+    },
+    {
+      "id": "visualize@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs",
+      "why": "Ships with the ChatGPT desktop app, so Macs only"
+    },
+    {
+      "id": "browser@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs"
+    },
+    {
+      "id": "chrome@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs"
+    },
+    {
+      "id": "computer-use@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs"
+    },
+    {
+      "id": "unified-computer-use@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs"
+    },
+    {
+      "id": "computer-history@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs"
+    },
+    {
+      "id": "codex-app-tools@openai-bundled",
+      "tools": [
+        "codex"
+      ],
+      "machines": "macs"
+    }
+  ],
+  "remove_plugins": [],
+  "skill_sources": [
+    {
+      "name": "mattpocock",
+      "repo": "mattpocock/skills",
+      "list_from": ".claude-plugin/plugin.json",
+      "exclude": [
+        "prototype"
+      ],
+      "machines": "all"
+    },
+    {
+      "name": "tstack",
+      "repo": "t3dotgg/tstack",
+      "glob": "skills/*",
+      "exclude": [],
+      "machines": "all"
+    },
+    {
+      "name": "emil",
+      "repo": "emilkowalski/skills",
+      "glob": "skills/*",
+      "exclude": [
+        "prototype"
+      ],
+      "machines": "all"
+    },
+    {
+      "name": "local",
+      "dir": "skills",
+      "skills": {
+        "prototype": "all",
+        "resolving-merge-conflicts": "all",
+        "deslop": "all",
+        "fix-ci": "all",
+        "hillclimb": "all"
+      }
+    }
+  ],
+  "skill_dirs": [
+    "~/.claude/skills",
+    "~/.agents/skills"
+  ],
+  "machine_extras_left_alone": {
+    "all": [
+      "~/.codex/skills/.system (Codex built-ins)"
+    ]
+  },
+  "legacy_cleanup": {
+    "dirs": [
+      "~/.codex/skills",
+      "~/.claude/skills",
+      "~/.agents/skills"
+    ],
+    "keep": [
+      ".system"
+    ],
+    "rule": "Remove any skill folder in these dirs that the manifest doesn't install and that isn't a machine extra. Everything removed is tarred to ~/.agent-config/backups/ first."
+  },
+  "mcp": [
+    {
+      "name": "context7",
+      "tool": "claude",
+      "url": "https://mcp.context7.com/mcp",
+      "machines": "all"
+    },
+    {
+      "name": "openaiDeveloperDocs",
+      "tool": "codex",
+      "url": "https://developers.openai.com/mcp",
+      "machines": "all"
+    },
+    {
+      "name": "node_repl",
+      "tool": "codex",
+      "local": true,
+      "machines": "macs",
+      "why": "Managed by the ChatGPT app"
+    }
+  ],
+  "remove_mcp": [],
+  "guards": []
+}

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.agent-config</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/sh</string><string>-lc</string><string>sleep 60; python3 "$HOME/.agent-config/repo/bin/agent-config" sync</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/tmp/agent-config.out</string>
+  <key>StandardErrorPath</key><string>/tmp/agent-config.err</string>
+</dict>
+</plist>

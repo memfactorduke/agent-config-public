@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""agent-config: build this machine's agent instructions, plugins and skills from the repo.
+
+  agent-config sync            pull the repo, save local edits to drift, rebuild everything
+  agent-config sync --cleanup  also remove unmanaged legacy skills (first deploy; backed up)
+  agent-config render M DIR    write machine M's instruction files into DIR (no side effects)
+  agent-config drift           show local edits saved on drift/<machine> branches
+  agent-config status          what's managed here, plus unmanaged extras
+
+Your own layers live in ~/.agent-config/local/, which sync never overwrites:
+  personal.md            about you: identity, tailnet, remote box (the "personal" layer)
+  machines/<machine>.md  this machine (the "machine" layer; wins over the repo's copy)
+  manifest.json          extra machines, plugins, MCP servers and skill sources, merged into the repo's
+                         (lists append, objects merge; "dir" and "src" paths are relative to local/)
+
+Stdlib only; runs on Python 3.9+. State lives in ~/.agent-config/.
+"""
+import datetime, difflib, glob, hashlib, json, os, re, shutil, subprocess, sys, tarfile
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, ".agent-config")
+REPO = os.path.join(BASE, "repo")            # clone of agent-config
+DRIFT = os.path.join(BASE, "drift")          # clone of the drift repo, when the manifest names one
+LOCAL = os.path.join(BASE, "local")          # this person's own layers and manifest additions
+UPSTREAM = os.path.join(BASE, "upstream")
+STATE = os.path.join(BASE, "state.json")
+SKIP = set(os.environ.get("AGENT_CONFIG_SKIP", "").split(","))  # testing: e.g. plugins,mcp
+EXTRA_BIN = ["~/.local/bin", "~/.local/share/npm/bin", "/opt/homebrew/bin", "/usr/local/bin",
+             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS"]
+STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+LOG = []
+
+
+def say(msg):
+    LOG.append(msg)
+    print(msg, flush=True)
+
+
+def x(p):
+    return os.path.expanduser(p)
+
+
+def sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def run(cmd, cwd=None, check=True):
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([x(p) for p in EXTRA_BIN] + [env.get("PATH", "")])
+    r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"{' '.join(cmd)} failed: {r.stderr.strip() or r.stdout.strip()}")
+    return r
+
+
+def have(tool):
+    return run(["sh", "-c", f"command -v {tool}"], check=False).returncode == 0
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def machine_id():
+    try:
+        return open(os.path.join(BASE, "machine")).read().strip()
+    except FileNotFoundError:
+        sys.exit("Name this machine first, e.g.: mkdir -p ~/.agent-config && echo laptop > ~/.agent-config/machine")
+
+
+def on(spec, m, manifest):
+    if spec == "all":
+        return True
+    if spec == "macs":
+        here = "mac" if sys.platform == "darwin" else "linux"   # machines missing from the manifest
+        return manifest["machines"].get(m, {}).get("os", here) == "mac"
+    return m in spec
+
+
+def load_manifest(repo):
+    """The repo's manifest plus ~/.agent-config/local/manifest.json: lists append, objects merge."""
+    man = load_json(os.path.join(repo, "manifest.json"), {})
+    man.setdefault("machines", {})
+    for k, v in load_json(os.path.join(LOCAL, "manifest.json"), {}).items():
+        if isinstance(v, list):
+            for e in v:
+                if isinstance(e, dict) and ("dir" in e or "src" in e):
+                    e["_base"] = LOCAL                   # local entries' paths are relative to LOCAL
+            man[k] = man.get(k, []) + v
+        elif isinstance(v, dict) and isinstance(man.get(k), dict):
+            for kk, vv in v.items():
+                cur = man[k].get(kk)
+                man[k][kk] = cur + vv if isinstance(cur, list) and isinstance(vv, list) else vv
+        else:
+            man[k] = v
+    return man
+
+
+def drift_url(man):
+    return os.environ.get("AGENT_CONFIG_DRIFT_URL") or man.get("drift_url")
+
+
+# ---------- instructions ----------
+
+OPTIONAL_LAYERS = ("personal", "machine")   # local copy wins over the repo's; skipped if neither exists
+
+
+def layer_path(repo, layer, m):
+    rel = (f"machines/{m}" if layer == "machine" else layer) + ".md"
+    for base in ((LOCAL, repo) if layer in OPTIONAL_LAYERS else (repo,)):
+        if os.path.isfile(os.path.join(base, rel)):
+            return os.path.join(base, rel)
+    if layer not in OPTIONAL_LAYERS:
+        raise FileNotFoundError(os.path.join(repo, rel))
+
+
+def render(repo, m):
+    man = load_manifest(repo)
+    if drift_url(man):
+        note = "Editing this file is fine: edits are saved to a drift branch for review, then the file is rebuilt."
+    else:
+        note = ("Edits to this file are backed up to ~/.agent-config/backups, then overwritten; "
+                "put your own instructions in ~/.agent-config/local/personal.md.")
+    out = {}
+    for tool, t in man["instructions"].items():
+        names, parts = [], []
+        for layer in t["layers"]:
+            path = layer_path(repo, layer, m)
+            if path is None:
+                continue
+            names.append(m if layer == "machine" else layer.split("/")[-1].replace("claude-code", "claude"))
+            with open(path) as f:
+                parts.append(f.read().strip())
+        head = f"> Built daily from `{man.get('source', 'agent-config')}` ({' + '.join(names)}). {note}"
+        out[tool] = dict(path=t["path"], only_if_exists=t.get("only_if_exists"),
+                         text=head + "\n\n" + "\n\n".join(parts) + "\n")
+    return man, out
+
+
+def backup(path):
+    if not os.path.lexists(path):
+        return
+    dest = os.path.join(BASE, "backups", STAMP, path.lstrip("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.copytree(path, dest, symlinks=True)
+    else:
+        shutil.copy2(path, dest, follow_symlinks=False)
+
+
+def save_drift(url, m, name, path):
+    """Commit the locally edited file to drift/<machine> and push, before it's overwritten."""
+    if not os.path.isdir(os.path.join(DRIFT, ".git")):
+        run(["git", "clone", "-q", url, DRIFT])
+    branch = f"drift/{m}"
+    run(["git", "fetch", "-q", "origin"], cwd=DRIFT, check=False)
+    exists = run(["git", "rev-parse", "--verify", "-q", f"origin/{branch}"], cwd=DRIFT, check=False).returncode == 0
+    run(["git", "checkout", "-q", "-B", branch] + ([f"origin/{branch}"] if exists else []), cwd=DRIFT)
+    dest = os.path.join(DRIFT, m, name)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(path, dest)
+    run(["git", "add", "-A"], cwd=DRIFT)
+    if run(["git", "diff", "--cached", "--quiet"], cwd=DRIFT, check=False).returncode:
+        run(["git", "-c", "user.name=agent-config", "-c", "user.email=agent-config@localhost",
+             "commit", "-q", "-m", f"{m}: local edit to {path} ({STAMP})"], cwd=DRIFT)
+        run(["git", "push", "-q", "origin", branch], cwd=DRIFT)
+    say(f"drift: saved local edit of {path} to {branch}")
+
+
+def write_managed(state, m, key, path, text, drift_name, durl):
+    path = x(path)
+    old_sha = state["written"].get(path)
+    if os.path.isfile(path):
+        cur = open(path).read()
+        if cur == text:
+            state["written"][path] = sha(text)
+            return
+        if old_sha is None or sha(cur) != old_sha:      # first run, or edited since we wrote it
+            if durl:
+                save_drift(durl, m, drift_name, path)
+            else:
+                say(f"local edit of {path} backed up to {os.path.join(BASE, 'backups', STAMP)}")
+        backup(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.islink(path):
+        os.unlink(path)
+    with open(path, "w") as f:
+        f.write(text)
+    state["written"][path] = sha(text)
+    say(f"wrote {path}")
+
+
+# ---------- grok ----------
+
+def grok_compat(want):
+    path = x("~/.grok/config.toml")
+    if not os.path.isfile(path):
+        return
+    text = open(path).read()
+    for table, keys in want.items():
+        block = f"[{table}]\n" + "".join(f"{k} = {str(v).lower()}\n" for k, v in keys.items())
+        pat = re.compile(rf"^\[{re.escape(table)}\]\n(?:(?!\[).*\n?)*", re.M)
+        new = pat.sub(block, text) if pat.search(text) else text.rstrip("\n") + "\n\n" + block
+        if new != text:
+            backup(path)
+            open(path, "w").write(new)
+            say(f"grok: set [{table}] {keys}")
+            text = new
+
+
+# ---------- plugins & MCP ----------
+
+def plugins(man, m):
+    hc, hx = have("claude"), have("codex")
+    claude_ids = run(["claude", "plugin", "list", "--json"], check=False).stdout if hc else ""
+    codex_ids = run(["codex", "plugin", "list"], check=False).stdout if hx else ""
+    for mk in {p["marketplace"] for p in man["plugins"] if p.get("marketplace")}:
+        if hc:
+            run(["claude", "plugin", "marketplace", "add", mk], check=False)
+        if hx:
+            run(["codex", "plugin", "marketplace", "add", mk], check=False)
+    if hc:
+        run(["claude", "plugin", "marketplace", "update"], check=False)
+    if hx:
+        run(["codex", "plugin", "marketplace", "upgrade"], check=False)
+    for p in man["plugins"]:
+        if not on(p["machines"], m, man):
+            continue
+        if "claude" in p["tools"] and hc:
+            r = run(["claude", "plugin", "install", "--scope", "user", p["id"]], check=False)
+            run(["claude", "plugin", "update", p["id"]], check=False)
+            if p["id"] not in claude_ids:
+                say(f"claude plugin {p['id']}: {'installed' if r.returncode == 0 else 'FAILED ' + r.stderr.strip()[:200]}")
+        if "codex" in p["tools"] and hx and not re.search(rf"^{re.escape(p['id'])}\s+installed, enabled", codex_ids, re.M):
+            r = run(["codex", "plugin", "add", p["id"]], check=False)
+            say(f"codex plugin {p['id']}: {'installed' if r.returncode == 0 else 'FAILED ' + r.stderr.strip()[:200]}")
+    for p in man["remove_plugins"]:
+        if p["tool"] == "claude" and hc and p["id"] in claude_ids:
+            run(["claude", "plugin", "uninstall", p["id"]], check=False)
+            say(f"claude plugin {p['id']}: removed")
+        if p["tool"] == "codex" and hx and re.search(rf"^{re.escape(p['id'])}\s+installed", codex_ids, re.M):
+            run(["codex", "plugin", "remove", p["id"]], check=False)
+            say(f"codex plugin {p['id']}: removed")
+
+
+def mcp(man, m):
+    hc, hx = have("claude"), have("codex")
+    cl = run(["claude", "mcp", "list"], check=False).stdout if hc else ""
+    cx = run(["codex", "mcp", "list"], check=False).stdout if hx else ""
+    for s in man["mcp"]:
+        if s.get("local") or not on(s["machines"], m, man):
+            continue
+        if s["tool"] in ("claude", "both") and hc and not re.search(rf"^{re.escape(s['name'])}\b", cl, re.M):
+            run(["claude", "mcp", "add", "--scope", "user", "--transport", "http", s["name"], s["url"]], check=False)
+            say(f"claude mcp {s['name']}: added")
+        if s["tool"] in ("codex", "both") and hx and not re.search(rf"^{re.escape(s['name'])}\b", cx, re.M):
+            run(["codex", "mcp", "add", s["name"], "--url", s["url"]], check=False)
+            say(f"codex mcp {s['name']}: added")
+    for s in man["remove_mcp"]:
+        if s["tool"] == "codex" and hx and re.search(rf"^{re.escape(s['name'])}\b", cx, re.M):
+            run(["codex", "mcp", "remove", s["name"]], check=False)
+            say(f"codex mcp {s['name']}: removed")
+
+
+# ---------- guard hooks ----------
+
+def merge_hook_groups(path, event, entries, ours):
+    """Put each (matcher, handler) group into path's hooks[event]; drop retired groups of ours.
+
+    Our groups are recognised by a command under `ours`. An existing group is replaced in place and
+    a new one is appended, so other groups keep their positions (Codex keys hook trust by position).
+    """
+    d = load_json(path, {})
+    if not entries and event not in d.get("hooks", {}):
+        return
+    groups = d.setdefault("hooks", {}).setdefault(event, [])
+    before = json.dumps(d, sort_keys=True)
+    mine = lambda g: any(h.get("command", "").split(" ", 1)[-1].startswith(ours) for h in g.get("hooks", []))
+    wanted = {e["hooks"][0]["command"]: e for e in entries}
+    kept = []
+    for g in groups:
+        cmd = next((h["command"] for h in g.get("hooks", []) if mine({"hooks": [h]})), None)
+        if cmd is None:
+            kept.append(g)
+        elif cmd in wanted:
+            kept.append(wanted.pop(cmd))
+    kept += list(wanted.values())
+    d["hooks"][event] = kept
+    if json.dumps(d, sort_keys=True) != before:
+        backup(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(d, f, indent=2)
+            f.write("\n")
+        say(f"hooks: updated {path} ({event})")
+
+
+def trust_codex_hooks(commands):
+    """Record Codex trust for our hook commands, as its /hooks review would (hash-based)."""
+    env = dict(os.environ)
+    env["PATH"] = os.pathsep.join([x(p) for p in EXTRA_BIN] + [env.get("PATH", "")])
+    p = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, env=env)
+    n = [0]
+
+    def call(method, params):
+        n[0] += 1
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": n[0], "method": method, "params": params}) + "\n")
+        p.stdin.flush()
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                raise RuntimeError(f"codex app-server closed during {method}")
+            msg = json.loads(line)
+            if msg.get("id") == n[0]:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                return msg["result"]
+
+    import signal
+    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(RuntimeError("codex app-server timed out")))
+    signal.alarm(60)
+    try:
+        call("initialize", {"clientInfo": {"name": "agent-config", "version": "1"}})
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n")
+        p.stdin.flush()
+        hooks = [h for d in call("hooks/list", {"cwds": [HOME]})["data"] for h in d["hooks"]]
+        todo = {h["key"]: {"trusted_hash": h["currentHash"]} for h in hooks
+                if h["command"] in commands and h["trustStatus"] != "trusted"}
+        if todo:
+            call("config/batchWrite", {"edits": [{"keyPath": "hooks.state", "value": todo, "mergeStrategy": "upsert"}]})
+            say(f"codex hooks: trusted {len(todo)}")
+    finally:
+        signal.alarm(0)
+        p.terminate()
+
+
+def guards(man, m):
+    ours = os.path.join(REPO, "hooks") + os.sep
+    by_event = {}
+    for g in man.get("guards", []):
+        if not on(g.get("machines", "all"), m, man):
+            continue
+        cmd = f"python3 {os.path.join(REPO, g['script'])}"
+        handler = {"type": "command", "command": cmd, "timeout": g.get("timeout", 15)}
+        by_event.setdefault(g["event"], []).append((g, cmd, handler))
+    for event in set(by_event) | {"PreToolUse"}:
+        items = by_event.get(event, [])
+        if os.path.isdir(x("~/.claude")):
+            merge_hook_groups(x("~/.claude/settings.json"), event,
+                              [{"matcher": g["claude_matcher"], "hooks": [h]} for g, _, h in items], ours)
+        if os.path.isdir(x("~/.codex")):
+            merge_hook_groups(x("~/.codex/hooks.json"), event,
+                              [{"matcher": g["codex_matcher"], "hooks": [dict(h, statusMessage=g["status"])]}
+                               for g, _, h in items], ours)
+    commands = {cmd for items in by_event.values() for _, cmd, _ in items}
+    if commands and os.path.isdir(x("~/.codex")) and have("codex"):
+        trust_codex_hooks(commands)
+
+
+# ---------- skills ----------
+
+def upstream_skills(src):
+    """Return {skill_name: folder} for one skill source."""
+    if "dir" in src:
+        root = os.path.join(src.get("_base", REPO), src["dir"])
+        return {n: os.path.join(root, n) for n in src["skills"]}
+    dest = os.path.join(UPSTREAM, src["name"])
+    if os.path.isdir(os.path.join(dest, ".git")):
+        run(["git", "fetch", "-q", "--depth", "1", "origin"], cwd=dest)
+        run(["git", "reset", "-q", "--hard", "origin/HEAD"], cwd=dest)
+    else:
+        run(["git", "clone", "-q", "--depth", "1", f"https://github.com/{src['repo']}.git", dest])
+    if src.get("list_from"):
+        paths = [os.path.normpath(os.path.join(dest, p)) for p in load_json(os.path.join(dest, src["list_from"]), {})["skills"]]
+    else:
+        paths = [p for p in glob.glob(os.path.join(dest, src["glob"])) if os.path.isfile(os.path.join(p, "SKILL.md"))]
+    return {os.path.basename(p): p for p in paths if os.path.basename(p) not in src.get("exclude", [])}
+
+
+def skills(man, m, state, cleanup):
+    want = {}
+    for src in man["skill_sources"]:
+        for name, folder in upstream_skills(src).items():
+            spec = src["skills"][name] if "dir" in src else src["machines"]
+            if on(spec, m, man):
+                want[name] = (src["name"], folder)
+    for d in man["skill_dirs"]:
+        d = x(d)
+        os.makedirs(d, exist_ok=True)
+        for name, (srcname, folder) in want.items():
+            dest = os.path.join(d, name)
+            if os.path.lexists(dest):
+                if not os.path.isfile(os.path.join(dest, ".agent-config")):
+                    backup(dest)                         # an unmanaged copy we're replacing
+                shutil.rmtree(dest) if os.path.isdir(dest) and not os.path.islink(dest) else os.unlink(dest)
+            shutil.copytree(folder, dest, ignore=shutil.ignore_patterns(".git"))
+            open(os.path.join(dest, ".agent-config"), "w").write(f"managed by agent-config; source: {srcname}\n")
+        for name in set(state.get("skills", [])) - set(want):   # dropped from the manifest
+            dest = os.path.join(d, name)
+            if os.path.isfile(os.path.join(dest, ".agent-config")):
+                backup(dest)
+                shutil.rmtree(dest)
+                say(f"skill {name}: removed from {d}")
+    added = set(want) - set(state.get("skills", []))
+    if added:
+        say(f"skills installed: {', '.join(sorted(added))}")
+    state["skills"] = sorted(want)
+    if cleanup:
+        legacy_cleanup(man, m, want)
+
+
+def unmanaged(man, m, want):
+    extras = set(man["legacy_cleanup"]["keep"])
+    for key in ("all", m):
+        for e in man["machine_extras_left_alone"].get(key, []):
+            extras.update(re.findall(r"[a-z0-9-]+", e.split(" (")[0]))
+    found = []
+    managed_dirs = {x(d) for d in man["skill_dirs"]}
+    for d in man["legacy_cleanup"]["dirs"]:
+        for p in glob.glob(os.path.join(x(d), "*")):
+            n = os.path.basename(p)
+            if (n in want and x(d) in managed_dirs) or n in extras or n.startswith("hyperframes") and "hyperframes" in extras:
+                continue
+            if n == "synced" and d.endswith(".claude/skills"):
+                continue                                 # claude.ai account skills, managed by Claude
+            found.append(p)
+    return found
+
+
+def legacy_cleanup(man, m, want):
+    for p in unmanaged(man, m, want):
+        backup(p)
+        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.unlink(p)
+        say(f"cleanup: removed {p} (backed up)")
+
+
+# ---------- commands ----------
+
+def cmd_sync(cleanup=False):
+    m = machine_id()
+    state = load_json(STATE, {"written": {}, "skills": []})
+    if os.path.isdir(os.path.join(REPO, ".git")):
+        run(["git", "fetch", "-q", "origin"], cwd=REPO)
+        before = run(["git", "rev-parse", "HEAD"], cwd=REPO).stdout
+        run(["git", "reset", "-q", "--hard", "origin/main"], cwd=REPO)   # the repo always wins
+        me = os.path.join(REPO, "bin", "agent-config")
+        if run(["git", "rev-parse", "HEAD"], cwd=REPO).stdout != before and os.path.abspath(__file__) == me \
+                and not os.environ.get("AGENT_CONFIG_REEXEC"):
+            os.environ["AGENT_CONFIG_REEXEC"] = "1"                      # run the freshly pulled code
+            os.execv(sys.executable, [sys.executable, me] + sys.argv[1:])
+    else:                                          # first run: clone where this script came from
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        url = os.environ.get("AGENT_CONFIG_REPO_URL") or \
+            run(["git", "remote", "get-url", "origin"], cwd=here, check=False).stdout.strip()
+        if not url:
+            sys.exit(f"No repo at {REPO}: clone it there, or set AGENT_CONFIG_REPO_URL.")
+        run(["git", "clone", "-q", url, REPO])
+    man, files = render(REPO, m)
+    durl = drift_url(man)
+    for tool, f in files.items():
+        if f["only_if_exists"] and not os.path.isdir(x(f["only_if_exists"])):
+            continue
+        write_managed(state, m, tool, f["path"], f["text"], os.path.basename(os.path.dirname(x(f["path"]))) + "-" + os.path.basename(f["path"]), durl)
+    for f in man["files"]:
+        src = os.path.join(f.get("_base", REPO), f["src"])
+        write_managed(state, m, f["src"], f["dest"], open(src).read(), f["src"], durl)
+    grok_compat(man.get("grok_config", {}))
+    for p in man.get("remove_files", {}).get(m, []):
+        if os.path.lexists(x(p)):
+            backup(x(p))
+            os.unlink(x(p))
+            say(f"removed {p}")
+    for name, step in (("plugins", lambda: plugins(man, m)), ("mcp", lambda: mcp(man, m)),
+                       ("guards", lambda: guards(man, m)), ("skills", lambda: skills(man, m, state, cleanup))):
+        if name in SKIP:
+            continue
+        try:
+            step()
+        except Exception as e:                           # one failing step must not stop the rest
+            say(f"ERROR: {e}")
+    state["last_sync"] = STAMP
+    state["commit"] = run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO).stdout.strip()
+    os.makedirs(BASE, exist_ok=True)
+    json.dump(state, open(STATE, "w"), indent=1)
+    with open(os.path.join(BASE, "sync.log"), "a") as f:
+        f.write(f"--- {STAMP} {m} @ {state['commit']}\n" + "\n".join(LOG) + "\n")
+
+
+def cmd_render(m, outdir):
+    _, files = render(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), m)
+    for tool, f in files.items():
+        p = os.path.join(outdir, m, tool + "--" + f["path"].replace("~/", "").replace("/", "__"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(f["text"])
+        print(p)
+
+
+def cmd_drift():
+    url = drift_url(load_manifest(REPO))
+    if not url:
+        print(f"No drift repo set up: local edits are only backed up, under {os.path.join(BASE, 'backups')}.")
+        return
+    if not os.path.isdir(os.path.join(DRIFT, ".git")):
+        run(["git", "clone", "-q", url, DRIFT])
+    run(["git", "fetch", "-q", "--prune", "origin"], cwd=DRIFT)
+    branches = [b.strip() for b in run(["git", "branch", "-r", "--format=%(refname:short)"], cwd=DRIFT).stdout.split() if "/drift/" in b]
+    if not branches:
+        print("No drift: nothing was edited locally.")
+        return
+    if os.path.isdir(os.path.join(REPO, ".git")):
+        run(["git", "fetch", "-q", "origin"], cwd=REPO)
+        run(["git", "reset", "-q", "--hard", "origin/main"], cwd=REPO)
+    for b in branches:
+        m = b.split("/")[-1]
+        print(f"\n===== {m} =====")
+        print(run(["git", "log", "--format=  %ad  %s", "--date=short", b], cwd=DRIFT).stdout)
+        _, files = render(REPO, m)
+        for tool, f in files.items():
+            name = os.path.basename(os.path.dirname(x(f["path"]))) + "-" + os.path.basename(f["path"])
+            edited = run(["git", "show", f"{b}:{m}/{name}"], cwd=DRIFT, check=False)
+            if edited.returncode == 0:
+                diff = difflib.unified_diff(f["text"].splitlines(), edited.stdout.splitlines(),
+                                            f"repo ({tool})", f"edited on {m}", lineterm="")
+                print("\n".join(diff) or f"  {name}: same as the repo now")
+
+
+def cmd_status():
+    m = machine_id()
+    state = load_json(STATE, {})
+    man = load_manifest(REPO) if os.path.isfile(os.path.join(REPO, "manifest.json")) else None
+    print(f"machine {m}; last sync {state.get('last_sync')} at {state.get('commit')}")
+    print("files:", *state.get("written", {}), sep="\n  ")
+    print("managed skills:", ", ".join(state.get("skills", [])))
+    extra = unmanaged(man, m, set(state.get("skills", []))) if man else []
+    print("unmanaged skills (left alone):", *extra, sep="\n  ")
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:] or ["status"]
+    if a[0] == "sync":
+        cmd_sync(cleanup="--cleanup" in a)
+    elif a[0] == "render":
+        cmd_render(a[1], a[2])
+    elif a[0] == "drift":
+        cmd_drift()
+    elif a[0] == "status":
+        cmd_status()
+    else:
+        print(__doc__)

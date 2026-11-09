@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync agent instructions, plugins and skills from agent-config
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash -lc 'python3 "$HOME/.agent-config/repo/bin/agent-config" sync'
