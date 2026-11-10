@@ -15,6 +15,10 @@ When I need to decide, explain the options in plain English and recommend one. R
 - Fable only when I ask for it. Never `max` effort.
 - Keep a running chat's model and effort; change them only when I ask.
 
+## Parallel work
+
+When parts of a task can run in parallel, run them in parallel by default.
+
 ## Where subagents run
 
 My remote box, with its T3 IDs, is named under "Me and my machines". If none is named there, run subagents on this machine and skip this section.
