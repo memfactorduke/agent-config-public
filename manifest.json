@@ -207,7 +207,8 @@
         "resolving-merge-conflicts": "all",
         "deslop": "all",
         "fix-ci": "all",
-        "hillclimb": "all"
+        "hillclimb": "all",
+        "proof": "all"
       }
     }
   ],

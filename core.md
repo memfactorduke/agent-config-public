@@ -6,6 +6,10 @@ When I say something exists and you can't find it, treat that as a lead and keep
 
 When I need to decide, explain the options in plain English and recommend one. Reports and comparisons I ask for come as a polished, clearly laid out, visually designed HTML page, rendered and checked before you hand it over.
 
+## Proof
+
+Finished work comes with proof I can check at a glance on my phone: a screenshot, a short recording, the rendered page, or the passing tests plus one live request. A claim alone isn't done. The `proof` skill has the recipe for each kind of work.
+
 ## Models and subagents
 
 - Subagents run the latest GPT Sol, except UI work, which runs the latest Claude Opus. Always high reasoning effort.

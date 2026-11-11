@@ -31,7 +31,7 @@ Infer what's missing, and state your inferences in the same message as the setup
 **Ask the setup questions** and wait for the answers before building. Skip any question the request already answers. Put your recommendation first:
 
 1. **Threshold** out of 10: 9 (recommended), 8, 10.
-2. **Max rounds**: no cap (recommended; a stall still stops the run and asks you), 5, 10.
+2. **Max rounds**: no cap (recommended; a plateau still ends the run on its own, see Autopilot), 5, 10.
 3. **Reviewers**: the models you listed, more than one allowed. Pre-mark the latest Claude Opus and the latest GPT Sol. If either is unreachable, pre-mark the strongest reachable model from another provider in its place.
 
 Each chosen model gets one reviewer.
@@ -42,7 +42,9 @@ Use your harness's question tool (`AskUserQuestion` in Claude Code, `request_use
 
 **Define the pass.** The overall score must reach the threshold. So must every criterion the user named as a target; by default, that's all of them. Every hard requirement must hold, and the reviewer must report no blockers (for a candidate set, none tagged with that candidate's ID).
 
-Done when the threshold, the round cap, the mapped council, the criteria, the bar, the hard requirements, the pass and the finish are all fixed. Post them in the kickoff message.
+**Set the floor.** The plateau floor is the threshold minus 2 (7 for a 9), unless the user names one. Autopilot (step 5) can ship a revision that plateaus at or above it.
+
+Done when the threshold, the round cap, the mapped council, the criteria, the bar, the hard requirements, the pass, the floor and the finish are all fixed. Post them in the kickoff message.
 
 ## 2. Write the brief
 
@@ -93,8 +95,19 @@ Check every review against the pass. If its verdict contradicts its own scores o
 - **Fix themes, not instances**: when the same kind of complaint comes back in a new place, fix the whole class once (one vocabulary, one layout token, one source of truth) and name the theme in `ROUND.md`.
 - **Hold the scope**: fix the blockers you agree with. Decline any that would grow the work beyond the request, and record why in `ROUND.md`. When reviewers disagree, decide, and tell both next round. Do the cheap nits; nits never block.
 - **Keep the best** (one artifact): if every slot scores a revision below the previous one, revert to the better revision before fixing.
-- **Stall**: if for two rounds no slot's overall score rises above its best so far (for a candidate set, the leader's lowest score), or one blocker survives two fixes, pivot: fix the theme, rethink the design, or try something more radical. If the next round is still flat, stop and ask the user, with the ledger.
-- **Cap**: every review round counts toward the cap, re-checks included. At the cap, stop. Report the best revision, its scores and its open blockers, then ask how to proceed.
+- **Stall**: if for two rounds no slot's overall score rises above its best so far (for a candidate set, the leader's lowest score), or one blocker survives two fixes, pivot: fix the theme, rethink the design, or try something more radical. If the next round is still flat, the run has **plateaued**: go to Autopilot.
+- **Cap**: every review round counts toward the cap, re-checks included. Reaching the cap also counts as a plateau: go to Autopilot.
+
+### Autopilot
+
+A plateau ends the run without a question to the user. Take the **best revision**: the one with the highest lowest overall score across slots in a single round (for a candidate set, the leader). Then:
+
+- **Ship it** when it's **safe to ship**: every hard requirement holds, every slot's overall score in that round is at or above the floor, its checks pass, and none of its open blockers is a **safety blocker**. A safety blocker is data loss or corruption, a security or privacy leak, a break in something that works today, or a finish step that would publish, send or otherwise do something the user didn't ask for. Restore that revision if the work has moved on, do the finish exactly as for a pass, and mark it **shipped at plateau** in the report and in any PR description.
+- **Hold it** otherwise: leave the best revision ready but unshipped, and report what blocks it.
+
+Either way, send the user one summary instead of a question: the outcome (shipped at plateau or held), the score table, the open blockers ranked, and the one change most likely to clear the bar if they want another run. If `agent-ping` exists (`~/.agent-config/repo/bin/agent-ping`), also send a two-line ping with `--from hillclimb --level info`.
+
+Autopilot is the default. If the user asks to be consulted at a stall or the cap, stop there and ask instead, with the ledger.
 
 Otherwise, go back to step 3.
 
@@ -102,6 +115,7 @@ Otherwise, go back to step 3.
 
 Do the finish the user asked for. Report:
 
+- the outcome: passed, shipped at plateau, or held;
 - a score table, one row per slot and one column per round, writing `no score` where a reviewer gave none;
 - one line per round on what changed;
 - the final revision or winning candidate, with paths to the snapshots;
