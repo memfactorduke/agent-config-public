@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Send a short machine alert to Mem's Grok Bot."""
+import argparse
+import datetime as dt
+import json
+import os
+import stat
+import sys
+import time
+import urllib.error
+import urllib.request
+
+LEVELS = ("info", "warn", "down")
+HOME = os.path.expanduser("~")
+CREDENTIALS = os.path.join(HOME, ".config", "agent-ping", "grok.json")
+LOG = os.path.join(HOME, ".local", "state", "agent-ping", "pings.jsonl")
+DEDUP_HOURS = 20
+
+
+def iso_now():
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def machine():
+    path = os.path.join(HOME, ".agent-config", "machine")
+    try:
+        value = open(path, encoding="utf-8").read().strip()
+    except OSError:
+        value = ""
+    return value or os.uname().nodename
+
+
+def append_log(entry):
+    os.makedirs(os.path.dirname(LOG), mode=0o700, exist_ok=True)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+    try:
+        os.chmod(LOG, 0o600)
+    except OSError:
+        pass
+
+
+def read_log():
+    try:
+        lines = open(LOG, encoding="utf-8").read().splitlines()
+    except OSError:
+        return []
+    result = []
+    for line in lines:
+        try:
+            result.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return result
+
+
+def recent_success(key):
+    if not key:
+        return False
+    cutoff = time.time() - DEDUP_HOURS * 3600
+    for entry in reversed(read_log()):
+        if entry.get("key") != key or entry.get("status") != 200:
+            continue
+        try:
+            when = dt.datetime.fromisoformat(entry["time"]).timestamp()
+        except (KeyError, ValueError, TypeError, OverflowError):
+            continue
+        if when >= cutoff:
+            return True
+    return False
+
+
+def load_credentials():
+    try:
+        mode = stat.S_IMODE(os.stat(CREDENTIALS).st_mode)
+        if mode & 0o077:
+            raise ValueError("credentials file must be mode 600")
+        with open(CREDENTIALS, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(f"credentials not found at {CREDENTIALS}")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"invalid credentials at {CREDENTIALS}: {exc}")
+    if not isinstance(data, dict) or not isinstance(data.get("url"), str) or not isinstance(data.get("key"), str):
+        raise RuntimeError(f"invalid credentials at {CREDENTIALS}: expected url and key")
+    return data
+
+
+def send(args):
+    body = {
+        "from": args.source,
+        "level": args.level,
+        "message": args.message,
+        "machine": machine(),
+        "sent_at": iso_now(),
+    }
+    if args.dry_run:
+        print(json.dumps(body, ensure_ascii=False, sort_keys=True))
+        return 0
+    if recent_success(args.key):
+        append_log({"time": iso_now(), "from": args.source, "level": args.level,
+                    "key": args.key, "message": args.message, "status": None, "error": "deduped"})
+        print("deduped")
+        return 0
+    try:
+        credentials = load_credentials()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+    request = urllib.request.Request(
+        credentials["url"],
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": "Bearer " + credentials["key"], "Content-Type": "application/json"},
+        method="POST",
+    )
+    last_error = ""
+    for attempt in range(3):
+        status = None
+        error = None
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                status = response.status
+                if status == 200:
+                    append_log({"time": iso_now(), "from": args.source, "level": args.level,
+                                "key": args.key, "message": args.message, "status": status, "error": None})
+                    return 0
+                error = f"HTTP {status}"
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            error = f"HTTP {exc.code}"
+        except (OSError, urllib.error.URLError) as exc:
+            error = str(exc)[:240]
+        last_error = error or "HTTP request failed"
+        append_log({"time": iso_now(), "from": args.source, "level": args.level,
+                    "key": args.key, "message": args.message, "status": status, "error": error})
+        if attempt < 2:
+            time.sleep(0.5 * (2 ** attempt))
+    print(last_error, file=sys.stderr)
+    return 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--from", dest="source", required=True)
+    parser.add_argument("--level", choices=LEVELS, required=True)
+    parser.add_argument("--key")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("message")
+    return send(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

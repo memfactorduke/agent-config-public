@@ -489,6 +489,11 @@ def cmd_sync(cleanup=False):
     json.dump(state, open(STATE, "w"), indent=1)
     with open(os.path.join(BASE, "sync.log"), "a") as f:
         f.write(f"--- {STAMP} {m} @ {state['commit']}\n" + "\n".join(LOG) + "\n")
+    if "health" not in SKIP and not os.environ.get("AGENT_CONFIG_HEALTH_NO_TIMER"):
+        health = os.path.join(REPO, "bin", "agent-health")
+        if os.path.isfile(health):
+            r = run([sys.executable, health, "install"], check=False)
+            say(f"health timer: {'installed' if r.returncode == 0 else 'FAILED ' + (r.stderr.strip() or r.stdout.strip())[:200]}")
 
 
 def cmd_render(m, outdir):

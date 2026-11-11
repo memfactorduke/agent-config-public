@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""Run the machine health checks and report only persistent problems."""
+import argparse
+import datetime as dt
+import json
+import os
+import plistlib
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOME = os.path.expanduser("~")
+STATE_DIR = os.environ.get("AGENT_HEALTH_STATE_DIR", os.path.join(HOME, ".local", "state", "agent-health"))
+STATUS_PATH = os.path.join(STATE_DIR, "status.json")
+EVENTS_PATH = os.path.join(STATE_DIR, "events.jsonl")
+PING_LOG = os.path.join(HOME, ".local", "state", "agent-ping", "pings.jsonl")
+MANIFEST_PATH = os.path.join(ROOT, "manifest.json")
+PING = os.path.join(ROOT, "bin", "agent-ping")
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).astimezone()
+
+
+def iso(value=None):
+    return (value or now()).isoformat(timespec="seconds")
+
+
+def parse_time(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value).astimezone()
+    except (TypeError, ValueError):
+        return None
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temp = path + ".tmp"
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(temp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def run(argv, timeout=15, input_text=None):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input_text)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(argv, 124, "", str(exc))
+
+
+def machine_id():
+    try:
+        value = open(os.path.join(HOME, ".agent-config", "machine"), encoding="utf-8").read().strip()
+    except OSError:
+        value = ""
+    return value or socket.gethostname()
+
+
+def config_for(machine):
+    path = os.environ.get("AGENT_HEALTH_CONFIG", os.path.join(ROOT, "health", machine + ".json"))
+    data = load_json(path, {})
+    if not isinstance(data, dict):
+        raise RuntimeError("health config must be an object")
+    return data
+
+
+def fail(spec, detail):
+    return {"state": spec.get("failure_state", "warn"), "detail": detail}
+
+
+def check_filesystem(spec):
+    path = os.path.expanduser(spec["path"])
+    try:
+        st = os.statvfs(path)
+        free = st.f_bavail * st.f_frsize
+        total = st.f_blocks * st.f_frsize
+        pct = (free * 100 / total) if total else 0
+    except OSError as exc:
+        return fail(spec, f"{path}: {exc}")
+    if spec.get("min_free_percent") is not None and pct < spec["min_free_percent"]:
+        return fail(spec, f"{path} has {pct:.1f}% free, below {spec['min_free_percent']}%")
+    if spec.get("min_free_gb") is not None and free < spec["min_free_gb"] * 1024 ** 3:
+        return fail(spec, f"{path} has {free / 1024 ** 3:.1f} GiB free, below {spec['min_free_gb']} GiB")
+    if spec.get("writable") and not os.access(path, os.W_OK):
+        return fail(spec, f"{path} is not writable")
+    return {"state": "ok", "detail": f"{path} has {pct:.1f}% free"}
+
+
+def check_command(spec, remote=False):
+    argv = spec.get("argv")
+    if remote:
+        host = spec["host"]
+        command = spec.get("command") or " ".join(argv or [])
+        result = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                      "sh -lc " + shlex.quote(command)], spec.get("timeout", 15))
+    else:
+        if not argv:
+            return fail(spec, "command check has no argv")
+        result = run(argv, spec.get("timeout", 15))
+    output = (result.stdout + " " + result.stderr).strip()
+    if result.returncode != 0:
+        return fail(spec, output[-400:] or f"exit {result.returncode}")
+    pattern = spec.get("contains")
+    if pattern and not re.search(pattern, output, re.I):
+        return fail(spec, f"output did not contain {pattern!r}: {output[-300:]}")
+    return {"state": "ok", "detail": output[-400:] or "command succeeded"}
+
+
+def check_http(spec):
+    status = None
+    try:
+        request = urllib.request.Request(spec["url"], headers={"User-Agent": "agent-health/1"})
+        with urllib.request.urlopen(request, timeout=spec.get("timeout", 5)) as response:
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    except (OSError, urllib.error.URLError) as exc:
+        return fail(spec, f"{spec['url']}: {exc}")
+    allowed = spec.get("statuses", [200])
+    if status not in allowed:
+        return fail(spec, f"{spec['url']} returned HTTP {status}")
+    return {"state": "ok", "detail": f"{spec['url']} returned HTTP {status}"}
+
+
+def check_tcp(spec):
+    try:
+        with socket.create_connection((spec["host"], int(spec["port"])), timeout=spec.get("timeout", 5)):
+            return {"state": "ok", "detail": f"{spec['host']}:{spec['port']} accepted a connection"}
+    except OSError as exc:
+        return fail(spec, f"{spec['host']}:{spec['port']}: {exc}")
+
+
+def check_launchd(spec):
+    if sys.platform != "darwin":
+        return {"state": "ok", "detail": "launchd check skipped on non-macOS"}
+    result = run(["launchctl", "list"], 8)
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[-1] == spec["label"]:
+            if fields[0] not in ("-", "0"):
+                return {"state": "ok", "detail": f"{spec['label']} is running (pid {fields[0]})"}
+            return fail(spec, f"{spec['label']} is loaded but not running")
+    return fail(spec, f"{spec['label']} is not loaded")
+
+
+def check_launchd_prefix(spec):
+    if sys.platform != "darwin":
+        return {"state": "ok", "detail": "launchd check skipped on non-macOS"}
+    result = run(["launchctl", "list"], 8)
+    labels = [line.split()[-1] for line in result.stdout.splitlines() if line.strip() and line.split()[-1].startswith(spec["prefix"])]
+    if not labels and not spec.get("allow_none", True):
+        return fail(spec, f"no loaded launch agent starts with {spec['prefix']}")
+    return {"state": "ok", "detail": f"loaded matching agents: {', '.join(labels) or 'none'}"}
+
+
+def check_systemd(spec):
+    result = run(["systemctl", "--user", "is-active", spec["unit"]], 8)
+    if result.returncode or result.stdout.strip() != "active":
+        return fail(spec, f"{spec['unit']} is {result.stdout.strip() or 'inactive'}")
+    return {"state": "ok", "detail": f"{spec['unit']} is active"}
+
+
+def check_memory(spec):
+    values = {}
+    try:
+        for line in open("/proc/meminfo", encoding="utf-8"):
+            key, value = line.split(":", 1)
+            values[key] = int(value.strip().split()[0]) * 1024
+        available = values["MemAvailable"]
+        total = values["MemTotal"]
+    except (OSError, KeyError, ValueError):
+        return {"state": "ok", "detail": "memory metrics unavailable"}
+    pct = available * 100 / total if total else 0
+    if pct < spec.get("min_available_percent", 10):
+        return fail(spec, f"{pct:.1f}% memory available")
+    return {"state": "ok", "detail": f"{pct:.1f}% memory available"}
+
+
+def check_load(spec):
+    load = os.getloadavg()[0]
+    limit = os.cpu_count() * spec.get("max_per_cpu", 2.0)
+    if load > limit:
+        return fail(spec, f"1-minute load {load:.2f} exceeds {limit:.2f}")
+    return {"state": "ok", "detail": f"1-minute load {load:.2f}"}
+
+
+def check_probe(spec):
+    volume = os.path.expanduser(spec["path"])
+    if spec.get("probe_binary") and not os.access(os.path.expanduser(spec["probe_binary"]), os.X_OK):
+        return fail(spec, "the existing external-volume probe binary is missing or not executable")
+    if not os.path.ismount(volume):
+        return fail(spec, f"{volume} is not mounted")
+    if not os.access(volume, os.W_OK):
+        return fail(spec, f"{volume} is not writable")
+    probe = load_json(os.path.expanduser(spec["probe_result"]), {})
+    if probe.get("state") == "running":
+        age = time.time() - float(probe.get("t", 0))
+        if age > spec.get("probe_timeout_seconds", 120):
+            return fail(spec, f"external-volume write/read probe stuck for {int(age)}s")
+    elif probe.get("result") not in (None, "ok", "not_mounted"):
+        return fail(spec, f"external-volume probe reported {probe.get('result')}: {probe.get('detail', '')}".strip())
+    if probe.get("t") and time.time() - float(probe["t"]) > spec.get("probe_stale_seconds", 8 * 3600):
+        return fail(spec, "external-volume probe result is stale")
+    return {"state": "ok", "detail": "external volume is mounted, writable, and its existing probe is healthy"}
+
+
+def check_sync(spec):
+    state = load_json(os.path.expanduser(spec["state"]), {})
+    stamp = state.get("last_sync")
+    try:
+        when = dt.datetime.strptime(stamp, "%Y%m%d-%H%M%S").replace(tzinfo=now().tzinfo)
+    except (TypeError, ValueError):
+        return fail(spec, "agent-config has no valid last_sync")
+    age = (now() - when).total_seconds()
+    if age > spec.get("max_age_seconds", 36 * 3600):
+        return fail(spec, f"agent-config last sync was {age / 3600:.1f}h ago")
+    return {"state": "ok", "detail": f"agent-config synced {stamp}"}
+
+
+def check_expiry_file(spec):
+    path = os.path.expanduser(spec["path"])
+    data = load_json(path, None)
+    if data is None:
+        if spec.get("optional", True):
+            return {"state": "ok", "detail": "no local expiry cache is available"}
+        return fail(spec, f"expiry cache {path} is missing")
+    values = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in ("expiresAt", "nextExpiresAt"):
+                    values.append(child)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    soon = now() + dt.timedelta(days=spec.get("warn_within_days", 7))
+    dates = []
+    for value in values:
+        try:
+            if isinstance(value, (int, float)):
+                date = dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).astimezone()
+            else:
+                date = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+        if now() <= date <= soon:
+            dates.append(date)
+    if dates:
+        return fail(spec, "a local environment link expires within 7 days: " + min(dates).isoformat())
+    return {"state": "ok", "detail": "no local environment link expires within 7 days"}
+
+
+def check_standing_warn(spec):
+    return {"state": "warn", "detail": spec.get("detail", "standing warning")}
+
+
+def run_check(spec):
+    kind = spec["kind"]
+    if kind == "filesystem": return check_filesystem(spec)
+    if kind == "command": return check_command(spec)
+    if kind == "ssh_command": return check_command(spec, remote=True)
+    if kind == "http": return check_http(spec)
+    if kind == "tcp": return check_tcp(spec)
+    if kind == "launchd": return check_launchd(spec)
+    if kind == "launchd_prefix": return check_launchd_prefix(spec)
+    if kind == "systemd": return check_systemd(spec)
+    if kind == "memory": return check_memory(spec)
+    if kind == "load": return check_load(spec)
+    if kind == "probe": return check_probe(spec)
+    if kind == "sync": return check_sync(spec)
+    if kind == "expiry_file": return check_expiry_file(spec)
+    if kind == "standing_warn": return check_standing_warn(spec)
+    return fail(spec, f"unknown check kind {kind}")
+
+
+def append_event(machine, check, result, action, pinged):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    event = {"at": iso(), "machine": machine, "check": check, "state": result["state"],
+             "detail": result["detail"], "action": action, "pinged": bool(pinged)}
+    with open(EVENTS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+    try:
+        os.chmod(EVENTS_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def ping(machine, spec, state, detail, action=None, recovery=False):
+    key = f"{machine}:{spec['id']}" + (":recovery" if recovery else "")
+    if recovery:
+        message = f"{machine} recovered: {spec['id']} is healthy again."
+        level = "info"
+    else:
+        tried = f" Already tried: {action}." if action else ""
+        need = spec.get("needs", "No action is needed unless it persists.")
+        message = f"{machine} {spec['id']} is {state}: {detail.rstrip('.')}.{tried} {need}"
+        level = state
+    result = run([sys.executable, PING, "--from", "health", "--level", level, "--key", key, message], 30)
+    return result.returncode == 0
+
+
+def apply_fix(spec):
+    fix = spec.get("fix")
+    if not fix:
+        return None
+    guard = fix.get("guard_argv")
+    if guard:
+        guarded = run(guard, fix.get("guard_timeout", 10))
+        if guarded.returncode != 0 or guarded.stdout.strip() not in ("0", "0\n"):
+            return "safe fix skipped because active work is running"
+    typ = fix.get("type")
+    if typ == "launchd_restart":
+        label = fix["label"]
+        uid = str(os.getuid())
+        result = run(["launchctl", "kickstart", f"gui/{uid}/{label}"], 20)
+        return f"restart {label} {'succeeded' if result.returncode == 0 else 'failed'}"
+    if typ == "systemd_restart":
+        result = run(["systemctl", "--user", "restart", fix["unit"]], 30)
+        return f"restart {fix['unit']} {'succeeded' if result.returncode == 0 else 'failed'}"
+    if typ == "sync":
+        env = dict(os.environ, AGENT_CONFIG_HEALTH_NO_TIMER="1")
+        result = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "agent-config"), "sync"],
+                                capture_output=True, text=True, timeout=120, env=env)
+        return "agent-config sync " + ("succeeded" if result.returncode == 0 else "failed")
+    return "unknown safe fix"
+
+
+def run_checks(machine, config):
+    status = load_json(STATUS_PATH, {})
+    if not isinstance(status, dict): status = {}
+    checks = config.get("checks", [])
+    for spec in checks:
+        check_id = spec["id"]
+        previous = status.get(check_id, {})
+        result = run_check(spec)
+        old_state = previous.get("state", "ok")
+        absence_streak = int(previous.get("absence_streak", 0))
+        if result["state"] != "ok" and spec.get("grace_failures"):
+            absence_streak += 1
+            if absence_streak < int(spec["grace_failures"]):
+                result = {"state": "ok", "detail": f"{result['detail']} (within sleep grace)"}
+        elif result["state"] == "ok":
+            absence_streak = 0
+        bad_streak = int(previous.get("bad_streak", 0)) + 1 if result["state"] != "ok" else 0
+        good_streak = int(previous.get("good_streak", 0)) + 1 if result["state"] == "ok" else 0
+        action = None
+        if result["state"] != "ok" and spec.get("fix") and not previous.get("fix_attempted"):
+            action = apply_fix(spec)
+        elif result["state"] != "ok":
+            action = previous.get("last_action")
+        pinged = False
+        bad_since = (previous.get("bad_since") or iso()) if result["state"] != "ok" else None
+        persist = float(spec.get("persist_minutes", os.environ.get("AGENT_HEALTH_PERSIST_MINUTES", 15))) * 60
+        persisted = bad_since is not None and (now() - parse_time(bad_since)).total_seconds() >= persist
+        should_ping = result["state"] != "ok" and bad_streak >= 2 and persisted and not (spec.get("notify_once") and previous.get("notified_once"))
+        if should_ping:
+            pinged = ping(machine, spec, result["state"], result["detail"], action)
+        if result["state"] == "ok" and old_state != "ok" and previous.get("notified_once"):
+            pinged = ping(machine, spec, "ok", result["detail"], recovery=True)
+        if result["state"] != old_state:
+            append_event(machine, check_id, result, action, pinged)
+        status[check_id] = {"state": result["state"], "detail": result["detail"], "at": iso(),
+                            "bad_streak": bad_streak, "good_streak": good_streak, "bad_since": bad_since,
+                            "last_action": action or (previous.get("last_action") if result["state"] != "ok" else None),
+                            "fix_attempted": bool(action) if result["state"] == "ok" else bool(previous.get("fix_attempted") or action),
+                            "absence_streak": absence_streak,
+                            "notified_once": bool(previous.get("notified_once") or pinged) if result["state"] != "ok" else False}
+    save_json(STATUS_PATH, status)
+    return status
+
+
+def cmd_check():
+    machine = machine_id()
+    status = run_checks(machine, config_for(machine))
+    bad = [f"{k}={v['state']}" for k, v in status.items() if v.get("state") != "ok"]
+    print(f"machine {machine}: " + ("; ".join(bad) if bad else "ok"))
+    return 1 if bad else 0
+
+
+def cmd_status():
+    machine = machine_id()
+    status = load_json(STATUS_PATH, {})
+    print(f"machine {machine}")
+    if not status:
+        print("no checks have run")
+        return 0
+    for check_id, value in status.items():
+        print(f"{check_id}: {value.get('state')} ({value.get('detail', '')}); "
+              f"bad streak {value.get('bad_streak', 0)}; last action {value.get('last_action') or 'none'}")
+    return 0
+
+
+def read_events(text):
+    events = []
+    for line in text.splitlines():
+        try: events.append(json.loads(line))
+        except json.JSONDecodeError: pass
+    return events
+
+
+def collect_events(machine, host):
+    if machine == machine_id():
+        try: return open(EVENTS_PATH, encoding="utf-8").read(), None
+        except OSError: return "", None
+    result = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                  "cat", "~/.local/state/agent-health/events.jsonl"], 15)
+    if result.returncode:
+        return "", result.stderr.strip() or "unreachable"
+    return result.stdout, None
+
+
+def collect_pings(machine, host):
+    if machine == machine_id():
+        return read_events(open(PING_LOG, encoding="utf-8").read()) if os.path.exists(PING_LOG) else []
+    result = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                  "cat", "~/.local/state/agent-ping/pings.jsonl"], 15)
+    return read_events(result.stdout) if result.returncode == 0 else []
+
+
+def report(since):
+    manifest = load_json(MANIFEST_PATH, {})
+    machines = manifest.get("machines", {})
+    cutoff = now() - dt.timedelta(seconds=since)
+    output = {"since": cutoff.isoformat(), "machines": {}}
+    for machine, info in machines.items():
+        text, error = collect_events(machine, info.get("host", machine))
+        if error:
+            output["machines"][machine] = {"error": error, "checks": {}}
+            continue
+        events = [e for e in read_events(text) if parse_time(e.get("at")) and parse_time(e.get("at")) >= cutoff]
+        pings = [p for p in collect_pings(machine, info.get("host", machine))
+                 if parse_time(p.get("time")) and parse_time(p.get("time")) >= cutoff and p.get("status") == 200]
+        grouped = {}
+        for event in events:
+            grouped.setdefault(event.get("check"), []).append(event)
+        checks = {}
+        for check, items in grouped.items():
+            incidents, current = [], None
+            for event in items:
+                if event.get("state") != "ok" and current is None:
+                    current = {"state": event.get("state"), "started": event.get("at"), "detail": event.get("detail"),
+                               "auto_fixes": 1 if event.get("action") else 0, "pings_sent": 1 if event.get("pinged") else 0}
+                elif event.get("state") != "ok" and current:
+                    if event.get("action"): current["auto_fixes"] += 1
+                elif event.get("state") == "ok" and current:
+                    current["recovered"] = event.get("at")
+                    started = parse_time(current["started"])
+                    current["downtime_seconds"] = max(0, (parse_time(event.get("at")) - started).total_seconds())
+                    incidents.append(current); current = None
+            if current:
+                current["downtime_seconds"] = max(0, (now() - parse_time(current["started"])).total_seconds())
+                incidents.append(current)
+            key_pings = {p.get("key") for p in pings if p.get("key", "").startswith(machine + ":" + check)}
+            checks[check] = {"incidents": incidents, "total_downtime": sum(i["downtime_seconds"] for i in incidents),
+                            "auto_fixes": sum(i["auto_fixes"] for i in incidents), "pings_sent": len(key_pings)}
+        output["machines"][machine] = {"checks": checks}
+    return output
+
+
+def parse_since(value):
+    match = re.fullmatch(r"(\d+)([dhm])", value)
+    if not match: raise ValueError("--since expects e.g. 7d, 12h, or 30m")
+    scale = {"d": 86400, "h": 3600, "m": 60}[match.group(2)]
+    return int(match.group(1)) * scale
+
+
+def install(dry_run=False):
+    repo_bin = os.path.expanduser("~/.agent-config/repo/bin/agent-health")
+    if sys.platform == "darwin":
+        path = os.path.expanduser("~/Library/LaunchAgents/com.agent-config.agent-health.plist")
+        plist = {"Label": "com.agent-config.agent-health", "ProgramArguments": ["/usr/bin/env", "python3", repo_bin, "check"],
+                 "StartInterval": 600, "RunAtLoad": True, "StandardOutPath": os.path.expanduser("~/.local/state/agent-health/launchd.out"),
+                 "StandardErrorPath": os.path.expanduser("~/.local/state/agent-health/launchd.err")}
+        if dry_run:
+            print(plistlib.dumps(plist).decode())
+            return 0
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f: plistlib.dump(plist, f)
+        uid = str(os.getuid())
+        run(["launchctl", "bootout", f"gui/{uid}/com.agent-config.agent-health"], 10)
+        result = run(["launchctl", "bootstrap", f"gui/{uid}", path], 10)
+        if result.returncode: print(result.stderr.strip(), file=sys.stderr); return 1
+        print(f"installed {path}")
+        return 0
+    service = os.path.expanduser("~/.config/systemd/user/agent-health.service")
+    timer = os.path.expanduser("~/.config/systemd/user/agent-health.timer")
+    service_text = "[Unit]\nDescription=Machine health watchdog\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/env python3 %s check\n" % repo_bin
+    timer_text = "[Unit]\nDescription=Run machine health watchdog every 10 minutes\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=10min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+    if dry_run:
+        print(service_text + "\n" + timer_text)
+        return 0
+    os.makedirs(os.path.dirname(service), exist_ok=True)
+    open(service, "w").write(service_text); open(timer, "w").write(timer_text)
+    run(["systemctl", "--user", "daemon-reload"], 20)
+    result = run(["systemctl", "--user", "enable", "--now", "agent-health.timer"], 20)
+    if result.returncode: print(result.stderr.strip(), file=sys.stderr); return 1
+    print(f"installed {timer}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("check")
+    sub.add_parser("status")
+    report_parser = sub.add_parser("report")
+    report_parser.add_argument("--since", default="7d")
+    report_parser.add_argument("--json", action="store_true")
+    install_parser = sub.add_parser("install")
+    install_parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "check": return cmd_check()
+    if args.command == "status": return cmd_status()
+    if args.command == "report":
+        value = report(parse_since(args.since))
+        print(json.dumps(value, indent=2, ensure_ascii=False) if args.json else json.dumps(value, indent=2, ensure_ascii=False))
+        return 0
+    return install(args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
