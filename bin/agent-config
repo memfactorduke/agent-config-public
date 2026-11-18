@@ -212,6 +212,23 @@ def grok_compat(want):
             text = new
 
 
+def claude_settings(want):
+    """Set each key in ~/.claude/settings.json to the manifest's value; other keys are left alone."""
+    path = x("~/.claude/settings.json")
+    if not want or not os.path.isdir(x("~/.claude")):
+        return
+    d = load_json(path, {})
+    changed = {k: v for k, v in want.items() if d.get(k) != v}
+    if not changed:
+        return
+    backup(path)
+    d.update(changed)
+    with open(path, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    say(f"claude settings: set {changed}")
+
+
 # ---------- plugins & MCP ----------
 
 def plugins(man, m):
@@ -470,6 +487,7 @@ def cmd_sync(cleanup=False):
         src = os.path.join(f.get("_base", REPO), f["src"])
         write_managed(state, m, f["src"], f["dest"], open(src).read(), f["src"], durl)
     grok_compat(man.get("grok_config", {}))
+    claude_settings(man.get("claude_settings", {}))
     for p in man.get("remove_files", {}).get(m, []):
         if os.path.lexists(x(p)):
             backup(x(p))
