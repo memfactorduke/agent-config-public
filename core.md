@@ -12,11 +12,11 @@ Finished work comes with proof I can check at a glance on my phone: a screenshot
 
 ## Models and subagents
 
-- Subagents run the latest GPT Sol, except UI work, which runs the latest Claude Opus. Always high reasoning effort.
+- Subagents run the latest GPT Sol, with two exceptions: UI work runs the latest Claude Opus, and computer use runs the latest GPT Astra. Always high reasoning effort.
 - Images are always made by Sol, even for UI work: generating or editing an image needs Codex's built-in `image_gen` tool, which no Claude model has. Codex shows that tool only when it is signed in with ChatGPT, so send image work to a machine where it is.
-- Claude models always run at standard speed. Sol subagents use their parent's speed tier; under a Claude parent, `default`.
-- Start every Sol prompt with `$pstack:poteto-mode` on its own line, then the brief.
-- Set effort and speed explicitly on every spawn; the tools' defaults differ. T3 `delegate_task`: Sol → `reasoningEffort: "high"`, `serviceTier` = parent's; Claude → `effort: "high"`, `fastMode: false`.
+- Claude models always run at standard speed. Astra computer-use subagents always run at fast speed (`serviceTier: "priority"`, which Codex labels "Fast"). Sol subagents use their parent's speed tier; under a Claude parent, `default`.
+- Start every Sol prompt with `$pstack:poteto-mode` on its own line, then the brief. Computer-use prompts leave that line out and start with the brief; they skip poteto mode.
+- Set effort and speed explicitly on every spawn; the tools' defaults differ. T3 `delegate_task`: Sol → `reasoningEffort: "high"`, `serviceTier` = parent's; Astra → `reasoningEffort: "high"`, `serviceTier: "priority"`; Claude → `effort: "high"`, `fastMode: false`.
 - Fable only when I ask for it. Never `max` effort.
 - Keep a running chat's model and effort; change them only when I ask.
 
