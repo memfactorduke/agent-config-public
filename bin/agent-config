@@ -487,13 +487,13 @@ def cmd_sync(cleanup=False):
         src = os.path.join(f.get("_base", REPO), f["src"])
         write_managed(state, m, f["src"], f["dest"], open(src).read(), f["src"], durl)
     grok_compat(man.get("grok_config", {}))
-    claude_settings(man.get("claude_settings", {}))
     for p in man.get("remove_files", {}).get(m, []):
         if os.path.lexists(x(p)):
             backup(x(p))
             os.unlink(x(p))
             say(f"removed {p}")
-    for name, step in (("plugins", lambda: plugins(man, m)), ("mcp", lambda: mcp(man, m)),
+    for name, step in (("claude_settings", lambda: claude_settings(man.get("claude_settings", {}))),
+                       ("plugins", lambda: plugins(man, m)), ("mcp", lambda: mcp(man, m)),
                        ("guards", lambda: guards(man, m)), ("skills", lambda: skills(man, m, state, cleanup))):
         if name in SKIP:
             continue
