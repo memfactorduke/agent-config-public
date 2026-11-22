@@ -248,21 +248,25 @@ def tokscale_autosubmit(man, m):
     current = status["clients"]
     # An empty filter uses Tokscale's default clients, which include Antigravity.
     clients = list(dict.fromkeys(current + required)) if current else []
-    if clients == current and not status.get("managedExecutableStale"):
-        return
+    if clients != current or status.get("managedExecutableStale"):
+        args = [cli, "autosubmit", "enable", "--interval", f"{status['intervalMinutes']}m"]
+        if clients:
+            args.extend(("--client", ",".join(clients)))
+        for key in ("scheduler", "since", "until", "year"):
+            if status.get(key):
+                args.extend((f"--{key}", status[key]))
+        for key in ("today", "yesterday", "week", "month"):
+            if status.get(key):
+                args.append(f"--{key}")
+        run(args)
+        added = [client for client in clients if client not in current]
+        say("tokscale: refreshed autosubmit" + (f", added {', '.join(added)}" if added else ""))
 
-    args = [cli, "autosubmit", "enable", "--interval", f"{status['intervalMinutes']}m"]
-    if clients:
-        args.extend(("--client", ",".join(clients)))
-    for key in ("scheduler", "since", "until", "year"):
-        if status.get(key):
-            args.extend((f"--{key}", status[key]))
-    for key in ("today", "yesterday", "week", "month"):
-        if status.get(key):
-            args.append(f"--{key}")
-    run(args)
-    added = [client for client in clients if client not in current]
-    say("tokscale: refreshed autosubmit" + (f", added {', '.join(added)}" if added else ""))
+    if status.get("scheduler") == "systemd":
+        timer = run(["systemctl", "--user", "show", "-p", "SubState", "--value", "tokscale-autosubmit.timer"])
+        if timer.stdout.strip() == "elapsed":
+            run(["systemctl", "--user", "start", "--no-block", "tokscale-autosubmit.service"])
+            say("tokscale: rearmed the systemd timer")
 
 
 # ---------- plugins & MCP ----------
