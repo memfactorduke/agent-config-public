@@ -55,6 +55,7 @@
       "why": "pstack's per-role models (its Claude and Codex builds both read this path)"
     }
   ],
+  "tokscale_autosubmit": [],
   "grok_config": {
     "compat.claude": {
       "agents": false,
