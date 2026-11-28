@@ -409,12 +409,13 @@ def guards(man, m):
         items = by_event.get(event, [])
         if os.path.isdir(x("~/.claude")):
             merge_hook_groups(x("~/.claude/settings.json"), event,
-                              [{"matcher": g["claude_matcher"], "hooks": [h]} for g, _, h in items], ours)
+                              [{"matcher": g["claude_matcher"], "hooks": [h]}
+                               for g, _, h in items if "claude_matcher" in g], ours)
         if os.path.isdir(x("~/.codex")):
             merge_hook_groups(x("~/.codex/hooks.json"), event,
                               [{"matcher": g["codex_matcher"], "hooks": [dict(h, statusMessage=g["status"])]}
-                               for g, _, h in items], ours)
-    commands = {cmd for items in by_event.values() for _, cmd, _ in items}
+                               for g, _, h in items if "codex_matcher" in g], ours)
+    commands = {cmd for items in by_event.values() for g, cmd, _ in items if "codex_matcher" in g}
     if commands and os.path.isdir(x("~/.codex")) and have("codex"):
         trust_codex_hooks(commands)
 
